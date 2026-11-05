@@ -35,3 +35,19 @@ PTY 写入和控制请求共用有序队列，代次在所有 Input 克隆之间
 真实 PTY 测试覆盖握手、CHECK、执行、续行、无回显输入、全屏程序和退出；原生窗口验证连续提交、自动恢复、草稿保留、普通终端锁定及尺寸同步。
 
 本轮已实现并完成 34 个单元测试、5 个真实 PTY 集成测试及原生窗口检查；详细验证范围和限制见 README。协议依赖 zsh 的 [Unix socket 模块](https://zsh.sourceforge.io/Doc/Release/Zsh-Modules.html) 和 [ZLE fd handler](https://zsh.sourceforge.io/Doc/Release/Zsh-Line-Editor.html)，当前平台边界为 macOS。初始化失败不提交启动环境修改，按原配置启动普通 shell。
+
+## 界面分层
+
+```text
+Theme（全局设计令牌） ─┬→ TerminalWindow（组合与输入路由）
+                      │     ├ 标题栏：当前目录 · shell
+                      │     ├ 网格：grid::layout（纯函数）→ grid::paint（GPUI）
+                      │     ├ 命令框卡片：CommandEditor
+                      │     └ 状态栏：chrome::tone + InputControl::label
+                      └→ CommandEditor（读取同一主题）
+```
+
+- 颜色、字体与尺寸只在 `theme.rs` 定义；组件不写十六进制颜色或像素常量。主题是 GPUI Global，视图通过 `observe_global` 在主题替换时重新测量格宽并重排，为以后的设置页和浅色主题留出入口。
+- 网格行列由 `theme::Metrics` 扣除标题栏、状态栏、网格留白和命令框卡片后计算，布局使用同一组数值，保证 PTY 尺寸与绘制区域一致。
+- `grid::layout` 不依赖窗口，可直接用 Alacritty `Term` 做单元测试：背景按行合并，同样式连续字符合并成文字段，中文按两格宽合并，组合字符单独定位；块光标下的文字在布局阶段换成反色。`grid::paint` 只负责把计划交给 GPUI，并把所有段对齐到主等宽字体的基线。
+- 界面外框只读取 `InputControl` 与 `ShellObserver` 的状态，不改变输入权限。OSC 7 当前目录与 OSC 133 一样可能被前台程序伪造，因此只用于展示。

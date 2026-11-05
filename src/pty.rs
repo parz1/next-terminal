@@ -95,6 +95,52 @@ pub fn capture_ls() -> anyhow::Result<Vec<u8>> {
     result
 }
 
+/// shell 的起始目录。从 Finder／Dock 启动时进程目录是 `/`，此时改用家目录，
+/// 与系统终端的习惯一致；命令行启动仍保留调用者所在目录。
+pub fn launch_directory() -> std::path::PathBuf {
+    choose_launch_directory(std::env::current_dir().ok(), std::env::var_os("HOME"))
+}
+
+fn choose_launch_directory(
+    current: Option<std::path::PathBuf>,
+    home: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
+    let home = home
+        .filter(|home| !home.is_empty())
+        .map(std::path::PathBuf::from);
+    match current {
+        Some(current) if current != std::path::Path::new("/") => current,
+        _ => home.unwrap_or_else(|| "/".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::choose_launch_directory;
+    use std::path::PathBuf;
+
+    #[test]
+    fn root_launch_directory_falls_back_to_home() {
+        let home = Some("/Users/me".into());
+        assert_eq!(
+            choose_launch_directory(Some("/work".into()), home.clone()),
+            PathBuf::from("/work")
+        );
+        assert_eq!(
+            choose_launch_directory(Some("/".into()), home.clone()),
+            PathBuf::from("/Users/me")
+        );
+        assert_eq!(
+            choose_launch_directory(None, home),
+            PathBuf::from("/Users/me")
+        );
+        assert_eq!(
+            choose_launch_directory(Some("/".into()), None),
+            PathBuf::from("/")
+        );
+    }
+}
+
 // 单窗口的持续 PTY；阻塞读写和进程回收均在后台线程。
 use crate::shell_control::{ControlEvent, ReadyRequest};
 use std::sync::mpsc::{self, Sender};
@@ -252,7 +298,7 @@ fn run_session(
     let mut writer = pair.master.take_writer()?;
     let mut command = CommandBuilder::new_default_prog();
     command.env_remove("SHELL");
-    command.cwd(std::env::current_dir()?);
+    command.cwd(launch_directory());
     command.env("TERM", "xterm-256color");
     let shell = command.get_shell();
     // 生命周期覆盖 shell 启动与退出；错误路径也由 TempDir 自动清理。

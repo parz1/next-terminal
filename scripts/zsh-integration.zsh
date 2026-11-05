@@ -42,6 +42,24 @@ function _next_terminal_preexec() {
     builtin printf '\e]133;C\a'
 }
 
+# OSC 7 报告当前目录，供窗口标题和路径标签显示；只用于展示，不参与输入授权。
+# 按字节做百分号编码，空格、中文、分号等都能无歧义地还原。
+function _next_terminal_report_cwd() {
+    emulate -L zsh
+    local LC_ALL=C
+    local i byte hex encoded=''
+    for (( i = 1; i <= ${#PWD}; i++ )); do
+        byte=${PWD[i]}
+        if [[ $byte == [A-Za-z0-9/._~-] ]]; then
+            encoded+=$byte
+        else
+            builtin printf -v hex '%%%02X' "'$byte"
+            encoded+=$hex
+        fi
+    done
+    builtin printf '\e]7;file://%s%s\a' "${HOST}" "$encoded"
+}
+
 function _next_terminal_precmd() {
     local command_status=$?
     if [[ ${_next_terminal_command_running:-0} == 1 ]]; then
@@ -49,6 +67,7 @@ function _next_terminal_precmd() {
     fi
     _next_terminal_command_running=0
     _next_terminal_prompt_cycle=1
+    _next_terminal_report_cwd
     builtin printf '\e]133;A\a'
     _next_terminal_control_send 'STATE prompt'
 }

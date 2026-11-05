@@ -39,6 +39,9 @@ fn configure_in(command: &mut CommandBuilder, root: &Path) -> anyhow::Result<Opt
     let integration = integration
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("临时集成路径不是 UTF-8"))?;
+    let control_path = socket_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("控制 socket 路径不是 UTF-8"))?;
     let source = format!(
         r#"# Generated for this session only.
 if [[ $NEXT_TERMINAL_ORIGINAL_ZDOTDIR_SET == 1 ]]; then
@@ -65,7 +68,7 @@ if [[ -o interactive && -o rcs ]]; then
 fi
 "#,
         integration.replace('\'', "'\\''"),
-        control_path = socket_path.display(),
+        control_path = control_path.replace('\'', "'\\''"),
         control_token = control.token(),
     );
     std::fs::write(directory.path().join(".zshenv"), source)?;

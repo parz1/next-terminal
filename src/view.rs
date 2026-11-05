@@ -1,31 +1,27 @@
+//! 单窗口终端视图：组合标题栏、终端网格、命令框和状态栏，并把输入事件交给会话。
+//! 绘制细节在 `grid`，按键编码在 `keys`，颜色尺寸在 `theme`，展示规则在 `chrome`。
+use crate::chrome::{self, display_path, shell_name};
 use crate::editor::CommandEditor;
+use crate::grid::{self, CellMetrics, CursorFocus, GridMetrics};
+use crate::keys::{key_bytes, paste_bytes, scroll_lines};
+use crate::theme::{Metrics, Theme, color, tint};
 use alacritty_terminal::Term;
 use alacritty_terminal::event::{Event as TerminalEvent, EventListener};
-use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
-use alacritty_terminal::term::{TermMode, cell::Flags, viewport_to_point};
-use alacritty_terminal::vte::ansi::{Color, Processor};
+use alacritty_terminal::term::{TermMode, viewport_to_point};
+use alacritty_terminal::vte::ansi::Processor;
 use gpui::{
-    App, BorderStyle, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, Hsla,
-    KeyDownEvent, MouseButton, Pixels, Render, SharedString, TextRun, Window, canvas, div, fill,
-    font, outline, point, prelude::*, px, rgb, size,
+    AnyElement, App, Bounds, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable, Hsla,
+    KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Render, SharedString, Window, canvas, div,
+    prelude::*, px,
 };
 use next_terminal::input_control::{InputControl, InputMode, InputTarget};
 use next_terminal::pty::{Event, Input, Session, Shutdown};
 use next_terminal::screen::GridSize;
 use next_terminal::shell_observer::ShellObserver;
 use std::time::Duration;
-
-const FONT_SIZE: f32 = 16.0;
-const LINE_HEIGHT: f32 = 22.0;
-const PADDING: f32 = 16.0;
-const GAP: f32 = 8.0;
-const STATUS_HEIGHT: f32 = 20.0;
-const COMPOSER_HEIGHT: f32 = 112.0;
-const DIRECT_HEIGHT: f32 = 32.0;
-const BACKGROUND: u32 = 0x181818;
-const FOREGROUND: u32 = 0xd4d4d4;
 
 // 光标位置查询等控制序列的回复必须回到同一个 PTY。
 struct Replies(Input);
@@ -43,48 +39,62 @@ pub struct TerminalWindow {
     processor: Processor,
     shell_observer: ShellObserver,
     focus: FocusHandle,
-    status: SharedString,
+    /// 启动失败、退出和输入错误等需要用户注意的消息；正常运行时为空。
+    notice: Option<SharedString>,
+    shell: SharedString,
     grid_size: GridSize,
-    cell_width: Pixels,
+    cell: CellMetrics,
     grid_bounds: Option<Bounds<Pixels>>,
     selecting: bool,
     scroll_remainder: f32,
     editor: Entity<CommandEditor>,
     control: InputControl,
-    launch_directory: SharedString,
+    launch_directory: String,
+    home: Option<String>,
+    window_title: String,
+    theme: Theme,
 }
 
 impl TerminalWindow {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let theme = Theme::global(cx).clone();
         let focus = cx.focus_handle();
         let editor = cx.new(CommandEditor::new);
         cx.observe(&editor, |_, _, cx| cx.notify()).detach();
+        // 主题是全局令牌；以后设置页替换主题时，视图重新测量格宽并重排。
+        cx.observe_global_in::<Theme>(window, |this, window, cx| {
+            this.theme = Theme::global(cx).clone();
+            this.sync_size(window, cx);
+        })
+        .detach();
         focus.focus(window);
-        let cell_width = measure_cell_width(window);
-        let grid_size = available_grid_size(window, cell_width, false);
+        let cell = CellMetrics::measure(window, &theme);
+        let grid_size = available_grid_size(window, cell.width, &theme.metrics, false);
         let mut view = Self {
             session: None,
             terminal: None,
             processor: Processor::default(),
             shell_observer: ShellObserver::default(),
             focus,
-            status: "正在启动默认 shell…".into(),
+            notice: None,
+            shell: SharedString::default(),
             grid_size,
-            cell_width,
+            cell,
             grid_bounds: None,
             selecting: false,
             scroll_remainder: 0.0,
             editor,
             control: InputControl::default(),
-            launch_directory: std::env::current_dir()
-                .map(|path| path.display().to_string())
-                .unwrap_or_default()
-                .into(),
+            launch_directory: next_terminal::pty::launch_directory().display().to_string(),
+            home: std::env::var("HOME").ok(),
+            window_title: String::new(),
+            theme,
         };
+        view.update_window_title(window);
         match Session::start_with_size(grid_size) {
             Err(error) => {
                 view.control.failed();
-                view.status = format!("启动失败：{error:#}").into();
+                view.notice = Some(format!("启动失败：{error:#}").into());
             }
             Ok((session, events)) => {
                 view.terminal = Some(next_terminal::screen::with_listener(Replies(
@@ -128,6 +138,7 @@ impl TerminalWindow {
                                     }
                                     this.refresh_control();
                                     this.apply_mode_change(previous, window, cx);
+                                    this.update_window_title(window);
                                     cx.notify();
                                 })
                             })
@@ -145,11 +156,31 @@ impl TerminalWindow {
             this.sync_size(window, cx);
         })
         .detach();
+        cx.observe_window_activation(window, |_, _, cx| cx.notify())
+            .detach();
         view
     }
 
     fn is_editing(&self) -> bool {
         self.control.mode() == InputMode::Composer
+    }
+
+    /// 当前目录优先使用 shell 的 OSC 7 报告，尚未报告时显示启动目录。
+    fn directory(&self) -> String {
+        display_path(
+            self.shell_observer
+                .cwd()
+                .unwrap_or(self.launch_directory.as_str()),
+            self.home.as_deref(),
+        )
+    }
+
+    fn update_window_title(&mut self, window: &mut Window) {
+        let title = self.directory();
+        if title != self.window_title {
+            window.set_window_title(&title);
+            self.window_title = title;
+        }
     }
 
     fn refresh_control(&mut self) {
@@ -202,14 +233,14 @@ impl TerminalWindow {
     }
 
     fn sync_size(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let cell_width = measure_cell_width(window);
-        let size = available_grid_size(window, cell_width, self.is_editing());
+        let cell = CellMetrics::measure(window, &self.theme);
+        let size = available_grid_size(window, cell.width, &self.theme.metrics, self.is_editing());
         if size != self.grid_size {
             if let Some(session) = &self.session {
                 if self.control.can_resize()
                     && let Err(error) = session.input.resize(size)
                 {
-                    self.status = format!("更新终端尺寸失败：{error}").into();
+                    self.notice = Some(format!("更新终端尺寸失败：{error}").into());
                     cx.notify();
                     return;
                 }
@@ -222,7 +253,7 @@ impl TerminalWindow {
             self.scroll_remainder = 0.0;
             self.grid_size = size;
         }
-        self.cell_width = cell_width;
+        self.cell = cell;
         cx.notify();
     }
 
@@ -230,7 +261,7 @@ impl TerminalWindow {
         let previous = self.control.mode();
         if editing {
             if self.control.confirm_empty_prompt().is_err() {
-                // 拒绝原因已由状态栏与直接交互栏说明，不污染隐藏的草稿错误。
+                // 拒绝原因已由状态栏说明，不污染隐藏的草稿错误。
                 return;
             }
         } else {
@@ -263,7 +294,12 @@ impl TerminalWindow {
             .is_some_and(|term| term.mode().contains(TermMode::BRACKETED_PASTE));
         let mut bytes = paste_bytes(&command, bracketed);
         bytes.push(b'\r');
-        let direct_size = available_grid_size(window, measure_cell_width(window), false);
+        let direct_size = available_grid_size(
+            window,
+            CellMetrics::measure(window, &self.theme).width,
+            &self.theme.metrics,
+            false,
+        );
         let written =
             session
                 .input
@@ -278,7 +314,7 @@ impl TerminalWindow {
         if let Err(error) = written {
             let previous = self.control.mode();
             self.control.failed();
-            self.status = format!("提交失败：{error}").into();
+            self.notice = Some(format!("提交失败：{error}").into());
             self.apply_mode_change(previous, window, cx);
             cx.notify();
             return;
@@ -298,9 +334,9 @@ impl TerminalWindow {
 
     fn handle_event(&mut self, event: Event) {
         match event {
-            Event::Started { shell, pid } => {
+            Event::Started { shell, .. } => {
                 self.control.started();
-                self.status = format!("{shell} · PID {}", pid.unwrap_or(0)).into()
+                self.shell = shell_name(&shell).to_owned().into();
             }
             Event::Output(bytes) => {
                 self.shell_observer.advance(&bytes, |_| {});
@@ -319,13 +355,13 @@ impl TerminalWindow {
             Event::Exited(status) => {
                 self.shell_observer.invalidate();
                 self.control.exited();
-                self.status = format!("shell 已退出：{status}").into();
+                self.notice = Some(format!("shell 已退出：{status}").into());
                 self.session.take();
             }
             Event::Failed(error) => {
                 self.shell_observer.invalidate();
                 self.control.failed();
-                self.status = format!("错误：{error}").into();
+                self.notice = Some(format!("错误：{error}").into());
             }
         }
     }
@@ -396,7 +432,7 @@ impl TerminalWindow {
             return;
         }
         let bytes = key_bytes(
-            event,
+            key,
             self.terminal
                 .as_ref()
                 .is_some_and(|term| term.mode().contains(TermMode::APP_CURSOR)),
@@ -415,7 +451,7 @@ impl TerminalWindow {
             if let Err(error) = session.input.write(bytes) {
                 self.shell_observer.invalidate();
                 self.control.failed();
-                self.status = format!("输入失败：{error}").into();
+                self.notice = Some(format!("输入失败：{error}").into());
                 cx.notify();
                 return;
             }
@@ -434,8 +470,8 @@ impl TerminalWindow {
     fn selection_position(&self, position: gpui::Point<Pixels>) -> Option<(GridPoint, Side)> {
         let bounds = self.grid_bounds?;
         let offset = position - bounds.origin;
-        let x = f32::from(offset.x) / f32::from(self.cell_width);
-        let row = (f32::from(offset.y) / LINE_HEIGHT)
+        let x = f32::from(offset.x) / f32::from(self.cell.width);
+        let row = (f32::from(offset.y) / self.theme.metrics.line_height)
             .floor()
             .clamp(0.0, self.grid_size.rows as f32 - 1.0) as i32;
         let column = x.floor().clamp(0.0, self.grid_size.columns as f32 - 1.0) as usize;
@@ -466,6 +502,7 @@ impl TerminalWindow {
         {
             return;
         }
+        let line_height = self.theme.metrics.line_height;
         let Some(terminal) = &mut self.terminal else {
             return;
         };
@@ -477,7 +514,7 @@ impl TerminalWindow {
         if matches!(event.touch_phase, gpui::TouchPhase::Started) {
             self.scroll_remainder = 0.0;
         }
-        let delta = f32::from(event.delta.pixel_delta(px(LINE_HEIGHT)).y) / LINE_HEIGHT;
+        let delta = f32::from(event.delta.pixel_delta(px(line_height)).y) / line_height;
         let lines = scroll_lines(delta, &mut self.scroll_remainder);
         if lines != 0 {
             let previous = terminal.grid().display_offset();
@@ -503,66 +540,11 @@ impl TerminalWindow {
             }
         }
     }
-}
 
-fn scroll_lines(delta: f32, remainder: &mut f32) -> i32 {
-    // 触控板的小位移累计到完整行；反向滚动立即丢弃旧方向的余量。
-    if delta != 0.0 && delta.signum() != remainder.signum() {
-        *remainder = 0.0;
-    }
-    *remainder += delta;
-    let lines = remainder.trunc() as i32;
-    *remainder -= lines as f32;
-    lines
-}
-
-fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
-    let text = text.replace("\r\n", "\n").replace('\r', "\n");
-    if bracketed {
-        // ESC 不能从粘贴内容中提前结束 bracketed paste。
-        format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', "")).into_bytes()
-    } else {
-        text.replace('\n', "\r").into_bytes()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{LINE_HEIGHT, paste_bytes, scroll_lines};
-
-    #[test]
-    fn wheel_lines_and_small_trackpad_deltas_scroll_in_both_directions() {
-        use gpui::{ScrollDelta, point, px};
-        let mut remainder = 0.0;
-        for (event, expected) in [
-            (ScrollDelta::Lines(point(0.0, 3.0)), 3),
-            (ScrollDelta::Pixels(point(px(0.0), px(11.0))), 0),
-            (ScrollDelta::Pixels(point(px(0.0), px(11.0))), 1),
-            (ScrollDelta::Pixels(point(px(0.0), px(17.0))), 0),
-            (ScrollDelta::Pixels(point(px(0.0), px(-11.0))), 0),
-            (ScrollDelta::Pixels(point(px(0.0), px(-11.0))), -1),
-            (ScrollDelta::Lines(point(0.0, -3.0)), -3),
-        ] {
-            let delta = f32::from(event.pixel_delta(px(LINE_HEIGHT)).y) / LINE_HEIGHT;
-            assert_eq!(scroll_lines(delta, &mut remainder), expected);
-        }
-    }
-
-    #[test]
-    fn paste_normalizes_line_endings_for_the_active_mode() {
-        assert_eq!(paste_bytes("a\r\nb\rc\nd", false), b"a\rb\rc\rd");
-        assert_eq!(
-            paste_bytes("中\r\nb\rc\nd", true),
-            "\x1b[200~中\nb\nc\nd\x1b[201~".as_bytes()
-        );
-    }
-
-    #[test]
-    fn bracketed_paste_cannot_be_closed_by_clipboard_escape_sequences() {
-        assert_eq!(
-            paste_bytes("a\x1b[201~b", true),
-            b"\x1b[200~a[201~b\x1b[201~"
-        );
+    fn history_offset(&self) -> usize {
+        self.terminal
+            .as_ref()
+            .map_or(0, |terminal| terminal.grid().display_offset())
     }
 }
 
@@ -576,84 +558,343 @@ fn close_after_shell(shutdown: Shutdown, window: &mut Window, cx: &mut App) {
     .detach();
 }
 
-fn key_bytes(event: &KeyDownEvent, application_cursor: bool) -> Option<Vec<u8>> {
-    let key = &event.keystroke;
-    if key.modifiers.control {
-        let byte = match key.key.as_str() {
-            "space" | "@" => 0,
-            "[" => 27,
-            "\\" => 28,
-            "]" => 29,
-            "^" => 30,
-            "_" => 31,
-            name if name.len() == 1 && name.as_bytes()[0].is_ascii_alphabetic() => {
-                name.as_bytes()[0].to_ascii_uppercase() - b'@'
-            }
-            _ => return None,
-        };
-        return Some(vec![byte]);
+// ---------------------------------------------------------------------------
+// 界面组合
+
+impl TerminalWindow {
+    /// 透明标题栏：macOS 左侧留出红绿灯位置，标题居中显示当前目录。
+    fn render_title_bar(&self) -> impl IntoElement {
+        let theme = &self.theme;
+        let metrics = theme.metrics;
+        let colors = theme.colors;
+        div()
+            .h(px(metrics.title_height))
+            .w_full()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .px(px(metrics.title_inset_left))
+            .gap(px(6.))
+            .text_size(px(metrics.ui_text))
+            .on_mouse_down(MouseButton::Left, |event: &MouseDownEvent, window, _| {
+                if event.click_count == 2 {
+                    window.titlebar_double_click();
+                }
+            })
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(color(colors.text_muted))
+                    .child(self.directory()),
+            )
+            .when(!self.shell.is_empty(), |bar| {
+                bar.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(color(colors.text_faint))
+                        .child(format!("· {}", self.shell)),
+                )
+            })
     }
-    let special: &[u8] = match key.key.as_str() {
-        "enter" => b"\r",
-        "backspace" => b"\x7f",
-        "tab" => b"\t",
-        "escape" => b"\x1b",
-        "space" => b" ",
-        "delete" => b"\x1b[3~",
-        "up" => {
-            if application_cursor {
-                b"\x1bOA"
-            } else {
-                b"\x1b[A"
-            }
+
+    fn render_terminal(&self, cx: &mut Context<Self>) -> AnyElement {
+        let metrics = self.theme.metrics;
+        let area = div()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .px(px(metrics.grid_padding_x))
+            .py(px(metrics.grid_padding_y))
+            .overflow_hidden();
+        if self.terminal.is_none() {
+            return area
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(color(self.theme.colors.text_muted))
+                .child(self.notice.clone().unwrap_or_else(|| "正在启动…".into()))
+                .into_any_element();
         }
-        "down" => {
-            if application_cursor {
-                b"\x1bOB"
+        let cell = self.cell;
+        let this = cx.weak_entity();
+        area.child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, cx| {
+                    let _ = this.update(cx, |this, cx| {
+                        this.grid_bounds = Some(bounds);
+                        let Some(terminal) = &this.terminal else {
+                            return;
+                        };
+                        // 命令框编辑时隐藏终端光标，避免同时出现两个活动光标。
+                        let cursor = this.control.can_write_direct().then(|| {
+                            if window.is_window_active() && this.focus.is_focused(window) {
+                                CursorFocus::Focused
+                            } else {
+                                CursorFocus::Unfocused
+                            }
+                        });
+                        let frame = grid::layout(terminal, &this.theme, cursor);
+                        let metrics = GridMetrics {
+                            origin: bounds.origin,
+                            cell,
+                            line_height: px(this.theme.metrics.line_height),
+                            font_size: px(this.theme.metrics.font_size),
+                        };
+                        grid::paint(&frame, &metrics, bounds, &this.theme, window, cx);
+                    });
+                },
+            )
+            .w(cell.width * self.grid_size.columns as f32)
+            .h(px(metrics.line_height * self.grid_size.rows as f32)),
+        )
+        .into_any_element()
+    }
+
+    /// 命令框是一张浮起的卡片：上行是目录与快捷键提示，下行是输入与执行按钮。
+    fn render_composer(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = &self.theme;
+        let metrics = theme.metrics;
+        let colors = theme.colors;
+        let focused = self.editor.focus_handle(cx).is_focused(window);
+        let error = self.editor.read(cx).error.clone();
+        let hints = div()
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .flex_shrink_0()
+            .child(hint(theme, "↵", "执行"))
+            .child(hint(theme, "esc", "交给终端"))
+            .child(hint(theme, "⇧⌘E", "切换"));
+        div()
+            .flex_shrink_0()
+            .h(px(metrics.composer_height))
+            .mx(px(metrics.composer_margin))
+            .mb(px(metrics.composer_margin))
+            .px(px(14.))
+            .py(px(10.))
+            .flex()
+            .flex_col()
+            .justify_between()
+            .rounded(px(metrics.radius))
+            .bg(color(colors.surface))
+            .border_1()
+            .border_color(if focused {
+                Hsla::from(tint(colors.accent, 0.5))
             } else {
-                b"\x1b[B"
-            }
-        }
-        "right" => {
-            if application_cursor {
-                b"\x1bOC"
-            } else {
-                b"\x1b[C"
-            }
-        }
-        "left" => {
-            if application_cursor {
-                b"\x1bOD"
-            } else {
-                b"\x1b[D"
-            }
-        }
-        "home" => b"\x1b[H",
-        "end" => b"\x1b[F",
-        _ => return key.key_char.as_ref().map(|text| text.as_bytes().to_vec()),
-    };
-    Some(special.to_vec())
+                color(colors.border_strong)
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .text_size(px(metrics.ui_small))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(color(colors.text_muted))
+                            .child(self.directory()),
+                    )
+                    .child(match error {
+                        Some(error) => div()
+                            .flex_shrink_0()
+                            .text_color(color(colors.danger))
+                            .child(error),
+                        None => hints,
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .font_family(theme.mono_family)
+                            .text_size(px(metrics.font_size + 2.))
+                            .text_color(color(colors.accent))
+                            .child("❯"),
+                    )
+                    .child(div().flex_1().min_w_0().child(self.editor.clone()))
+                    .child(
+                        div()
+                            .id("submit")
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .h(px(26.))
+                            .px(px(10.))
+                            .rounded(px(6.))
+                            .bg(tint(colors.accent, 0.14))
+                            .hover(|style| style.bg(tint(colors.accent, 0.24)))
+                            .text_size(px(metrics.ui_small))
+                            .text_color(color(colors.accent))
+                            .cursor_pointer()
+                            .child("执行")
+                            .child("↵")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.submit(window, cx);
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    ),
+            )
+    }
+
+    /// 状态栏：左侧是会话状态，右侧是历史位置、模式切换、网格尺寸和 shell。
+    fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = &self.theme;
+        let metrics = theme.metrics;
+        let colors = theme.colors;
+        let tone = chrome::tone(&self.control);
+        let history = self.history_offset();
+        let action =
+            (!self.is_editing() && self.control.is_live() && self.control.can_confirm_prompt())
+                .then(|| {
+                    if self.control.integrated() {
+                        "恢复命令框"
+                    } else {
+                        "启用命令框"
+                    }
+                });
+        div()
+            .h(px(metrics.status_height))
+            .w_full()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(12.))
+            .px(px(metrics.grid_padding_x))
+            .border_t_1()
+            .border_color(color(colors.border))
+            .text_size(px(metrics.ui_small))
+            .text_color(color(colors.text_muted))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .size(px(7.))
+                            .rounded_full()
+                            .bg(color(tone.color(&colors))),
+                    )
+                    .child(div().flex_shrink_0().child(self.control.label()))
+                    .when_some(self.notice.clone(), |row, notice| {
+                        row.child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(color(if tone == chrome::Tone::Error {
+                                    colors.danger
+                                } else {
+                                    colors.text_faint
+                                }))
+                                .child(notice),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(14.))
+                    .when(history > 0, |row| {
+                        row.child(
+                            div()
+                                .text_color(color(colors.accent))
+                                .child(format!("↑ {history} 行")),
+                        )
+                    })
+                    .when_some(action, |row, label| {
+                        row.child(
+                            div()
+                                .id("composer-toggle")
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .h(px(18.))
+                                .px(px(6.))
+                                .rounded(px(5.))
+                                .text_color(color(colors.text))
+                                .hover(|style| style.bg(color(colors.surface_raised)))
+                                .cursor_pointer()
+                                .child(label)
+                                .child(keycap(theme, "⇧⌘E"))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.set_editing(true, window, cx);
+                                        cx.stop_propagation();
+                                    }),
+                                ),
+                        )
+                    })
+                    .child(div().text_color(color(colors.text_faint)).child(format!(
+                        "{}×{}",
+                        self.grid_size.columns, self.grid_size.rows
+                    ))),
+            )
+    }
+}
+
+fn keycap(theme: &Theme, label: &'static str) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .h(px(16.))
+        .px(px(5.))
+        .rounded(px(4.))
+        .border_1()
+        .border_color(color(theme.colors.border_strong))
+        .bg(color(theme.colors.surface_raised))
+        .text_size(px(10.5))
+        .text_color(color(theme.colors.text_muted))
+        .child(label)
+}
+
+fn hint(theme: &Theme, key: &'static str, label: &'static str) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(5.))
+        .text_color(color(theme.colors.text_faint))
+        .child(keycap(theme, key))
+        .child(label)
 }
 
 impl Render for TerminalWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let root = div()
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.theme.colors;
+        div()
             .size_full()
             .flex()
             .flex_col()
-            .gap(px(GAP))
-            .p(px(PADDING))
             .overflow_hidden()
-            .bg(rgb(BACKGROUND))
-            .text_color(rgb(FOREGROUND))
-            .font_family("Menlo")
-            .text_size(px(13.0))
+            .bg(color(colors.background))
+            .text_color(color(colors.text))
+            .font_family(self.theme.ui_family)
+            .text_size(px(self.theme.metrics.ui_text))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
                     this.selecting = false;
                     if this
                         .grid_bounds
@@ -698,338 +939,37 @@ impl Render for TerminalWindow {
                     }
                 }),
             )
-            .child(
-                div()
-                    .h(px(STATUS_HEIGHT))
-                    .w_full()
-                    .flex_shrink_0()
-                    .line_height(px(STATUS_HEIGHT))
-                    .overflow_hidden()
-                    .child(format!(
-                        "{} × {} · {} · {} · {}{}",
-                        self.grid_size.columns,
-                        self.grid_size.rows,
-                        self.status,
-                        self.control.label(),
-                        self.shell_observer.label(),
-                        self.terminal
-                            .as_ref()
-                            .map(|terminal| {
-                                let offset = terminal.grid().display_offset();
-                                if offset == 0 {
-                                    String::new()
-                                } else {
-                                    format!(" · 历史 ↑{offset} 行")
-                                }
-                            })
-                            .unwrap_or_default()
-                    )),
-            );
-        if self.terminal.is_none() {
-            return root;
-        }
-        let cell_width = self.cell_width;
-        let this = cx.weak_entity();
-        let root = root.child(
-            canvas(
-                |_, _, _| (),
-                move |bounds, _, window, cx| {
-                    let _ = this.update(cx, |this, cx| {
-                        this.grid_bounds = Some(bounds);
-                        if let Some(terminal) = &this.terminal {
-                            paint_grid(
-                                terminal,
-                                bounds.origin,
-                                cell_width,
-                                this.control.can_write_direct(),
-                                window,
-                                cx,
-                            );
-                        }
-                    });
-                },
-            )
-            .w(cell_width * self.grid_size.columns as f32)
-            .h(px(LINE_HEIGHT * self.grid_size.rows as f32))
-            .flex_shrink_0(),
-        );
-        let footer = if self.is_editing() {
-            div()
-                .w_full()
-                .h(px(COMPOSER_HEIGHT))
-                .flex_shrink_0()
-                .bg(rgb(0x222321))
-                .border_t_1()
-                .border_color(rgb(0x49463f))
-                .border_l_2()
-                .border_color(rgb(0xe6b75d))
-                .px(px(14.))
-                .py(px(7.))
-                .flex()
-                .flex_col()
-                .gap(px(4.))
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(rgb(0x96938b))
-                        .overflow_hidden()
-                        .child(format!("启动目录 · {}", self.launch_directory)),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(10.))
-                        .child(
-                            div()
-                                .text_size(px(24.))
-                                .text_color(rgb(0xe6b75d))
-                                .child("❯"),
-                        )
-                        .child(div().flex_1().min_w_0().child(self.editor.clone()))
-                        .child(
-                            div()
-                                .px(px(10.))
-                                .py(px(4.))
-                                .border_1()
-                                .border_color(rgb(0x555148))
-                                .cursor_pointer()
-                                .child("↵")
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, window, cx| {
-                                        this.submit(window, cx);
-                                        cx.stop_propagation();
-                                    }),
-                                ),
-                        ),
-                )
-                .child(div().text_size(px(10.)).text_color(rgb(0x96938b)).child(
-                    self.editor.read(cx).error.clone().unwrap_or_else(|| {
-                        "命令编辑 · Enter 执行 · Esc 交给终端 · Cmd+Shift+E 切换".into()
-                    }),
-                ))
-        } else {
-            div()
-                .w_full()
-                .h(px(DIRECT_HEIGHT))
-                .flex_shrink_0()
-                .border_t_1()
-                .border_color(rgb(0x49463f))
-                .text_size(px(11.))
-                .text_color(rgb(0xaaa69c))
-                .flex()
-                .items_center()
-                .justify_between()
-                .child("终端直接交互")
-                .child(
-                    div()
-                        .cursor_pointer()
-                        .child(if self.control.is_live() {
-                            if self.control.can_confirm_prompt() {
-                                if self.control.integrated() {
-                                    "恢复自动命令框  ⇧⌘E"
-                                } else {
-                                    "确认已回到空主提示符，点击编辑命令  ⇧⌘E"
-                                }
-                            } else {
-                                "保持终端输入 · 等待空主提示符"
-                            }
-                        } else {
-                            "会话尚不可输入或已经结束"
-                        })
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, window, cx| {
-                                this.set_editing(true, window, cx);
-                                cx.stop_propagation();
-                            }),
-                        ),
-                )
-        };
-        root.child(div().flex_1()).child(footer)
+            .child(self.render_title_bar())
+            .child(self.render_terminal(cx))
+            .when(self.is_editing(), |root| {
+                root.child(self.render_composer(window, cx))
+            })
+            .child(self.render_status_bar(cx))
     }
 }
 
-fn measure_cell_width(window: &Window) -> Pixels {
-    window
-        .text_system()
-        .shape_line(
-            "M".into(),
-            px(FONT_SIZE),
-            &[text_run("M", rgb(FOREGROUND).into(), Flags::empty())],
-            None,
-        )
-        .width
-}
-
-fn available_grid_size(window: &Window, cell_width: Pixels, editing: bool) -> GridSize {
-    let viewport = window.viewport_size();
-    GridSize::from_pixels(
-        f32::from(viewport.width) - PADDING * 2.0,
-        f32::from(viewport.height)
-            - PADDING * 2.0
-            - STATUS_HEIGHT
-            - GAP * 3.0
-            - if editing {
-                COMPOSER_HEIGHT
-            } else {
-                DIRECT_HEIGHT
-            },
-        f32::from(cell_width),
-        LINE_HEIGHT,
-    )
-}
-
-fn text_run(text: &str, color: Hsla, flags: Flags) -> TextRun {
-    let mut face = font("Menlo");
-    if flags.contains(Flags::BOLD) {
-        face = face.bold();
-    }
-    if flags.contains(Flags::ITALIC) {
-        face = face.italic();
-    }
-    TextRun {
-        len: text.len(),
-        font: face,
-        color,
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    }
-}
-
-fn paint_grid(
-    terminal: &Term<Replies>,
-    origin: gpui::Point<Pixels>,
+/// 网格可用区域 = 窗口 − 标题栏 − 状态栏 − 网格留白 − （编辑时的）命令框卡片。
+/// 布局与这里的计算共用同一份 Metrics，保证 PTY 行列与实际绘制一致。
+fn available_grid_size(
+    window: &Window,
     cell_width: Pixels,
-    show_cursor: bool,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let selection = terminal
-        .selection
-        .as_ref()
-        .and_then(|selection| selection.to_range(terminal));
-    let display_offset = terminal.grid().display_offset();
-    // 先画背景，再画字形，避免后一个占位格的背景覆盖中文的右半边。
-    for row in 0..terminal.screen_lines() {
-        for column in 0..terminal.columns() {
-            let grid_point = viewport_to_point(display_offset, GridPoint::new(row, Column(column)));
-            let cell = &terminal.grid()[grid_point.line][grid_point.column];
-            let background = if cell.flags.contains(Flags::INVERSE) {
-                cell.fg
-            } else {
-                cell.bg
-            };
-            let bounds = Bounds::new(
-                origin + point(cell_width * column as f32, px(LINE_HEIGHT * row as f32)),
-                size(cell_width, px(LINE_HEIGHT)),
-            );
-            let selected = selection.is_some_and(|range| {
-                let point = grid_point;
-                range.contains(point)
-                    || (cell.flags.contains(Flags::WIDE_CHAR)
-                        && range.contains(GridPoint::new(point.line, Column(column + 1))))
-            });
-            window.paint_quad(fill(
-                bounds,
-                if selected {
-                    rgb(0x365880).into()
-                } else {
-                    resolve_color(background, terminal)
-                },
-            ));
-        }
-    }
-    for row in 0..terminal.screen_lines() {
-        for column in 0..terminal.columns() {
-            let grid_point = viewport_to_point(display_offset, GridPoint::new(row, Column(column)));
-            let cell = &terminal.grid()[grid_point.line][grid_point.column];
-            if cell.flags.intersects(
-                Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER | Flags::HIDDEN,
-            ) || cell.c == '\t'
-            {
-                continue;
-            }
-            let mut text = cell.c.to_string();
-            if let Some(extra) = cell.zerowidth() {
-                text.extend(extra);
-            }
-            if text == " " {
-                continue;
-            }
-            let foreground = if cell.flags.contains(Flags::INVERSE) {
-                cell.bg
-            } else {
-                cell.fg
-            };
-            let run = text_run(&text, resolve_color(foreground, terminal), cell.flags);
-            let line = window
-                .text_system()
-                .shape_line(text.into(), px(FONT_SIZE), &[run], None);
-            let position = origin + point(cell_width * column as f32, px(LINE_HEIGHT * row as f32));
-            // 不用字符串宽度定位下一格；每个字形始终回到网格给出的列位置。
-            if let Err(error) = line.paint(position, px(LINE_HEIGHT), window, cx) {
-                eprintln!("字形绘制失败：{error}");
-            }
-        }
-    }
-    if show_cursor && display_offset == 0 && terminal.mode().contains(TermMode::SHOW_CURSOR) {
-        let cursor = terminal.grid().cursor.point;
-        let cell = &terminal.grid()[cursor.line][cursor.column];
-        let width = if cell.flags.contains(Flags::WIDE_CHAR) {
-            cell_width * 2.0
-        } else {
-            cell_width
-        };
-        let bounds = Bounds::new(
-            origin
-                + point(
-                    cell_width * cursor.column.0 as f32,
-                    px(LINE_HEIGHT * cursor.line.0 as f32),
-                ),
-            size(width, px(LINE_HEIGHT)),
-        );
-        // 描边不遮住格内文字；暂不闪烁。
-        window.paint_quad(outline(bounds, rgb(0xf5c969), BorderStyle::Solid));
-    }
-}
-
-fn resolve_color(color: Color, terminal: &Term<Replies>) -> Hsla {
-    let index = match color {
-        Color::Spec(value) => {
-            return rgb((value.r as u32) << 16 | (value.g as u32) << 8 | value.b as u32).into();
-        }
-        Color::Named(value) => value as usize,
-        Color::Indexed(value) => value as usize,
+    metrics: &Metrics,
+    editing: bool,
+) -> GridSize {
+    let viewport = window.viewport_size();
+    let composer = if editing {
+        metrics.composer_height + metrics.composer_margin
+    } else {
+        0.0
     };
-    if let Some(value) = terminal.colors()[index] {
-        return rgb((value.r as u32) << 16 | (value.g as u32) << 8 | value.b as u32).into();
-    }
-    rgb(palette(index)).into()
-}
-
-fn palette(index: usize) -> u32 {
-    const ANSI: [u32; 16] = [
-        0x181818, 0xcd3131, 0x0dbc79, 0xe5e510, 0x2472c8, 0xbc3fbc, 0x11a8cd, 0xe5e5e5, 0x666666,
-        0xf14c4c, 0x23d18b, 0xf5f543, 0x3b8eea, 0xd670d6, 0x29b8db, 0xffffff,
-    ];
-    match index {
-        0..=15 => ANSI[index],
-        16..=231 => {
-            let value = index - 16;
-            let level = |x| if x == 0 { 0 } else { 55 + 40 * x as u32 };
-            level(value / 36) << 16 | level((value / 6) % 6) << 8 | level(value % 6)
-        }
-        232..=255 => {
-            let value = 8 + 10 * (index - 232) as u32;
-            value << 16 | value << 8 | value
-        }
-        257 => BACKGROUND,
-        258 => 0xf5c969,
-        259..=266 => (ANSI[index - 259] & 0xfefefe) >> 1,
-        268 => 0x888888,
-        _ => FOREGROUND,
-    }
+    GridSize::from_pixels(
+        f32::from(viewport.width) - metrics.grid_padding_x * 2.0,
+        f32::from(viewport.height)
+            - metrics.title_height
+            - metrics.status_height
+            - metrics.grid_padding_y * 2.0
+            - composer,
+        f32::from(cell_width),
+        metrics.line_height,
+    )
 }
