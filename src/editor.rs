@@ -1,10 +1,11 @@
 // Native single-line input, adapted from GPUI 0.2.2 examples/input.rs (Apache-2.0).
+use crate::theme::{self, Theme};
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine,
     SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill,
-    point, prelude::*, px, relative, rgb, size,
+    point, prelude::*, px, relative, size,
 };
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
@@ -507,6 +508,7 @@ impl Element for TextElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let palette = Theme::global(cx).colors;
         let input = self.input.read(cx);
         let content = input.content.clone();
         let selected_range = input.selected_range.clone();
@@ -514,7 +516,7 @@ impl Element for TextElement {
         let style = window.text_style();
 
         let (display_text, text_color) = if content.is_empty() {
-            (input.placeholder.clone(), rgb(0x77756f).into())
+            (input.placeholder.clone(), theme::color(palette.text_faint))
         } else {
             (content, style.color)
         };
@@ -578,7 +580,7 @@ impl Element for TextElement {
                         point(bounds.left() + cursor_pos - shift, bounds.top()),
                         size(px(2.), bounds.bottom() - bounds.top()),
                     ),
-                    rgb(0xe6b75d),
+                    theme::color(palette.accent),
                 )),
             )
         } else {
@@ -594,7 +596,7 @@ impl Element for TextElement {
                             bounds.bottom(),
                         ),
                     ),
-                    rgb(0x365880),
+                    theme::color(palette.selection),
                 )),
                 None,
             )
@@ -653,6 +655,8 @@ impl Element for TextElement {
 
 impl Render for CommandEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::global(cx);
+        let line_height = theme.metrics.line_height + 4.;
         div()
             .flex()
             .key_context("CommandEditor")
@@ -676,15 +680,14 @@ impl Render for CommandEditor {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .w_full()
-            .text_color(rgb(0xe6e1d8))
-            .font_family("Menlo")
-            .line_height(px(30.))
-            .text_size(px(18.))
+            .text_color(theme::color(theme.colors.text))
+            .font_family(theme.mono_family)
+            .line_height(px(line_height))
+            .text_size(px(theme.metrics.font_size + 1.))
             .child(
                 div()
-                    .h(px(30. + 4. * 2.))
+                    .h(px(line_height))
                     .w_full()
-                    .p(px(4.))
                     .overflow_hidden()
                     .child(TextElement { input: cx.entity() }),
             )

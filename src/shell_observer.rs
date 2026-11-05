@@ -30,13 +30,21 @@ pub enum ShellState {
 pub struct ShellObserver {
     parser: Parser,
     state: ShellState,
+    cwd: Option<String>,
 }
 
 impl ShellObserver {
     pub fn advance(&mut self, bytes: &[u8], mut on_mark: impl FnMut(ShellMark)) {
-        struct Marks<'a, F>(&'a mut ShellState, F);
+        struct Marks<'a, F>(&'a mut ShellState, &'a mut Option<String>, F);
         impl<F: FnMut(ShellMark)> Perform for Marks<'_, F> {
             fn osc_dispatch(&mut self, params: &[&[u8]], _: bool) {
+                // OSC 7 只更新显示用的当前目录；VTE 按分号切分参数，这里拼回原值。
+                if let [b"7", rest @ ..] = params {
+                    if let Some(path) = parse_osc7(&rest.join(&b';')) {
+                        *self.1 = Some(path);
+                    }
+                    return;
+                }
                 let mark = match params {
                     [b"133", b"A"] => ShellMark::PromptStarted,
                     [b"133", b"C"] => ShellMark::CommandStarted,
@@ -78,11 +86,18 @@ impl ShellObserver {
                     ShellMark::EditorFinished => ShellState::EditorInactive,
                     ShellMark::OtherEditor => ShellState::OtherEditor,
                 };
-                (self.1)(mark);
+                (self.2)(mark);
             }
         }
-        self.parser
-            .advance(&mut Marks(&mut self.state, &mut on_mark), bytes);
+        self.parser.advance(
+            &mut Marks(&mut self.state, &mut self.cwd, &mut on_mark),
+            bytes,
+        );
+    }
+
+    /// shell 最近一次通过 OSC 7 报告的目录。前台程序也能输出 OSC 7，因此只用于展示。
+    pub fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
     }
 
     pub fn state(&self) -> ShellState {
@@ -122,9 +137,53 @@ impl ShellObserver {
     }
 }
 
+/// 解析 `file://host/path`，路径按字节百分号解码；不是合法 UTF-8 或缺少路径时忽略。
+fn parse_osc7(uri: &[u8]) -> Option<String> {
+    let rest = uri.strip_prefix(b"file://")?;
+    let path = &rest[rest.iter().position(|&byte| byte == b'/')?..];
+    let mut bytes = Vec::with_capacity(path.len());
+    let mut index = 0;
+    while index < path.len() {
+        if path[index] == b'%' {
+            let hex = std::str::from_utf8(path.get(index + 1..index + 3)?).ok()?;
+            bytes.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            bytes.push(path[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn osc7_reports_decoded_directory_without_touching_shell_state() {
+        let mut observer = ShellObserver::default();
+        let mut marks = Vec::new();
+        observer.advance(
+            b"\x1b]7;file://mac.local/Users/me/d%20ir/%E4%B8%AD;x%25y\x07",
+            |mark| marks.push(mark),
+        );
+        assert_eq!(observer.cwd(), Some("/Users/me/d ir/中;x%y"));
+        assert!(marks.is_empty());
+        assert_eq!(observer.state(), ShellState::Unknown);
+        observer.invalidate();
+        assert_eq!(observer.cwd(), Some("/Users/me/d ir/中;x%y"));
+        // 非法编码、非 UTF-8、其他协议和缺少路径都不覆盖已知目录。
+        for bad in [
+            &b"\x1b]7;file://host/bad%zz\x07"[..],
+            b"\x1b]7;file://host/%FF\x07",
+            b"\x1b]7;kitty-shell-cwd://host/tmp\x07",
+            b"\x1b]7;file://host\x07",
+        ] {
+            observer.advance(bad, |_| {});
+        }
+        assert_eq!(observer.cwd(), Some("/Users/me/d ir/中;x%y"));
+    }
 
     #[test]
     fn editing_state_is_distinct_from_prompt_drawing_and_is_invalidated_on_input() {
