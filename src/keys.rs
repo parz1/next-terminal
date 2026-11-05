@@ -43,6 +43,19 @@ pub fn key_bytes(key: &Keystroke, application_cursor: bool) -> Option<Vec<u8>> {
     Some(special.to_vec())
 }
 
+/// 只产生可见文本的按键（可带 Shift），交给平台输入法处理，再经输入法上屏写入 PTY。
+/// 这样拼音等输入法能先拿到按键开始组字；回车、方向键和 Ctrl／Alt／Cmd 组合仍由
+/// `key_bytes` 直接编码。
+pub fn is_text_input(key: &Keystroke) -> bool {
+    let modifiers = &key.modifiers;
+    if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
+        return false;
+    }
+    key.key_char
+        .as_deref()
+        .is_some_and(|text| !text.is_empty() && !text.chars().any(char::is_control))
+}
+
 pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
     if bracketed {
@@ -106,6 +119,26 @@ mod tests {
             paste_bytes("a\x1b[201~b", true),
             b"\x1b[200~a[201~b\x1b[201~"
         );
+    }
+
+    #[test]
+    fn printable_keys_go_to_the_input_method_and_commands_do_not() {
+        for source in ["a->a", "shift-a->A", "space-> ", "1->1", "/->/"] {
+            assert!(is_text_input(&keystroke(source)), "{source}");
+        }
+        for source in [
+            "enter",
+            "backspace",
+            "tab->\t",
+            "escape",
+            "up",
+            "ctrl-c->c",
+            "alt-e->é",
+            "cmd-v->v",
+            "fn-a->a",
+        ] {
+            assert!(!is_text_input(&keystroke(source)), "{source}");
+        }
     }
 
     #[test]

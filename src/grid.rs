@@ -330,6 +330,7 @@ impl CellMetrics {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct GridMetrics {
     pub origin: gpui::Point<Pixels>,
     pub cell: CellMetrics,
@@ -420,6 +421,64 @@ pub fn paint(
             }
         }
     }
+}
+
+/// 直接终端模式的输入法组字文字：盖住光标处的格子，带下划线显示，并画出组字插入点。
+/// 组字文字尚未写入 PTY，所以不进入 Alacritty 网格，只是一层叠加。
+pub fn paint_preedit(
+    text: &str,
+    caret: usize,
+    origin: gpui::Point<Pixels>,
+    metrics: &GridMetrics,
+    theme: &Theme,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let line = shape_preedit(text, metrics, theme, window);
+    let width = line.width.max(metrics.cell.width);
+    window.paint_quad(fill(
+        Bounds::new(origin, size(width, metrics.line_height)),
+        theme::color(theme.colors.surface_raised),
+    ));
+    let baseline_shift =
+        ((metrics.cell.ascent - metrics.cell.descent) - (line.ascent - line.descent)) / 2.;
+    if let Err(error) = line.paint(
+        origin + point(px(0.), baseline_shift),
+        metrics.line_height,
+        window,
+        cx,
+    ) {
+        eprintln!("组字文字绘制失败：{error}");
+    }
+    window.paint_quad(fill(
+        Bounds::new(
+            origin + point(line.x_for_index(caret), px(0.)),
+            size(px(2.), metrics.line_height),
+        ),
+        theme::color(theme.colors.cursor),
+    ));
+}
+
+/// 组字文字的排版；绘制和候选框定位共用，保证候选框贴着实际显示的文字。
+pub fn shape_preedit(
+    text: &str,
+    metrics: &GridMetrics,
+    theme: &Theme,
+    window: &Window,
+) -> gpui::ShapedLine {
+    let style = TextStyle {
+        color: theme.colors.foreground,
+        bold: false,
+        italic: false,
+        underline: Underline::Straight,
+        strikethrough: false,
+    };
+    window.text_system().shape_line(
+        text.to_owned().into(),
+        metrics.font_size,
+        &[text_run(text, &style, theme)],
+        None,
+    )
 }
 
 pub fn text_run(text: &str, style: &TextStyle, theme: &Theme) -> TextRun {

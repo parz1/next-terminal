@@ -6,6 +6,7 @@ use gpui::{
 mod chrome;
 mod editor;
 mod grid;
+mod ime;
 mod keys;
 mod theme;
 mod view;
