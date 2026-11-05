@@ -169,4 +169,4 @@ SSH、SFTP、按客户／项目整理环境以及同事交接是未来候选，�
 
 ## 本机验证方式
 
-本轮自动恢复原生 UI 检查使用同一二进制的临时 `.app` 包装，位于被忽略的 `target/automatic-composer-preview/` 下；正常开发使用 `cargo run --locked`，尚未建立正式打包流程。本轮修改前的源码、脚本、测试和 README 已备份至 `target/automatic-composer-backup/`；项目已使用 Git 管理，远程仓库为 [parz1/next-terminal](https://github.com/parz1/next-terminal)（私有）。
+本轮自动恢复原生 UI 检查使用同一二进制的临时 `.app` 包装，位于被忽略的 `target/automatic-composer-preview/` 下；正常开发使用 `cargo run --locked`，尚未建立正式打包流程。本轮修改前的源码、脚本、测试和 README 已备份至 `target/automatic-composer-backup/`；项目已使用 Git 管理，远程仓库为 [parz1/next-terminal](https://github.com/parz1/next-terminal)（公开）。
