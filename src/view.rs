@@ -3,7 +3,8 @@
 use crate::chrome::{self, display_path, shell_name};
 use crate::editor::CommandEditor;
 use crate::grid::{self, CellMetrics, CursorFocus, GridMetrics};
-use crate::keys::{key_bytes, paste_bytes, scroll_lines};
+use crate::ime::Preedit;
+use crate::keys::{is_text_input, key_bytes, paste_bytes, scroll_lines};
 use crate::theme::{Metrics, Theme, color, tint};
 use alacritty_terminal::Term;
 use alacritty_terminal::event::{Event as TerminalEvent, EventListener};
@@ -13,14 +14,15 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::{TermMode, viewport_to_point};
 use alacritty_terminal::vte::ansi::Processor;
 use gpui::{
-    AnyElement, App, Bounds, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable, Hsla,
-    KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Render, SharedString, Window, canvas, div,
-    prelude::*, px,
+    AnyElement, App, Bounds, ClipboardItem, Context, Div, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent,
+    Pixels, Render, SharedString, UTF16Selection, Window, canvas, div, point, prelude::*, px,
 };
 use next_terminal::input_control::{InputControl, InputMode, InputTarget};
 use next_terminal::pty::{Event, Input, Session, Shutdown};
 use next_terminal::screen::GridSize;
 use next_terminal::shell_observer::ShellObserver;
+use std::ops::Range;
 use std::time::Duration;
 
 // 光标位置查询等控制序列的回复必须回到同一个 PTY。
@@ -53,6 +55,8 @@ pub struct TerminalWindow {
     home: Option<String>,
     window_title: String,
     theme: Theme,
+    /// 直接终端模式下输入法正在组字的文字；上屏前不写入 PTY。
+    preedit: Preedit,
 }
 
 impl TerminalWindow {
@@ -89,6 +93,7 @@ impl TerminalWindow {
             home: std::env::var("HOME").ok(),
             window_title: String::new(),
             theme,
+            preedit: Preedit::default(),
         };
         view.update_window_title(window);
         match Session::start_with_size(grid_size) {
@@ -212,6 +217,8 @@ impl TerminalWindow {
         if self.control.mode() == previous {
             return;
         }
+        // 输入目标改变时丢弃未上屏的组字，避免它在另一种模式下被写入。
+        self.preedit.clear();
         if self.is_editing() {
             self.editor.focus_handle(cx).focus(window);
         } else {
@@ -353,12 +360,14 @@ impl TerminalWindow {
                 }
             }
             Event::Exited(status) => {
+                self.preedit.clear();
                 self.shell_observer.invalidate();
                 self.control.exited();
                 self.notice = Some(format!("shell 已退出：{status}").into());
                 self.session.take();
             }
             Event::Failed(error) => {
+                self.preedit.clear();
                 self.shell_observer.invalidate();
                 self.control.failed();
                 self.notice = Some(format!("错误：{error}").into());
@@ -429,6 +438,11 @@ impl TerminalWindow {
         }
         if target != InputTarget::Terminal {
             cx.stop_propagation();
+            return;
+        }
+        // 可见字符交给平台输入法：拼音等先组字，上屏后经 replace_text_in_range 写入 PTY。
+        // 长按重复的按键仍在这里直接写入，避免 macOS 弹出重音字符菜单而不能连续输入。
+        if is_text_input(key) && !event.is_held {
             return;
         }
         let bytes = key_bytes(
@@ -541,10 +555,135 @@ impl TerminalWindow {
         }
     }
 
+    fn grid_metrics(&self, origin: gpui::Point<Pixels>, cell: CellMetrics) -> GridMetrics {
+        GridMetrics {
+            origin,
+            cell,
+            line_height: px(self.theme.metrics.line_height),
+            font_size: px(self.theme.metrics.font_size),
+        }
+    }
+
+    /// 终端光标所在格子的左上角（窗口坐标）；光标不在可见区域时返回 None。
+    fn cursor_origin(&self) -> Option<gpui::Point<Pixels>> {
+        let bounds = self.grid_bounds?;
+        let terminal = self.terminal.as_ref()?;
+        let cursor = terminal.grid().cursor.point;
+        let row = cursor.line.0 + terminal.grid().display_offset() as i32;
+        if row < 0 || row as usize >= self.grid_size.rows as usize {
+            return None;
+        }
+        Some(
+            bounds.origin
+                + point(
+                    self.cell.width * cursor.column.0 as f32,
+                    px(self.theme.metrics.line_height * row as f32),
+                ),
+        )
+    }
+
     fn history_offset(&self) -> usize {
         self.terminal
             .as_ref()
             .map_or(0, |terminal| terminal.grid().display_offset())
+    }
+}
+
+/// 直接终端模式的平台输入法接口。终端没有可编辑文档，范围只针对组字文字；
+/// 上屏文本与普通按键一样经 `write_input` 写入，仍受输入权限约束。
+impl EntityInputHandler for TerminalWindow {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        actual_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let (text, actual) = self.preedit.text_for_range(range_utf16);
+        actual_range.replace(actual);
+        Some(text)
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: self.preedit.selected_range_utf16(),
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.preedit.marked_range_utf16()
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.preedit.clear();
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range_utf16: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.preedit.clear();
+        if !text.is_empty() {
+            self.write_input(text.as_bytes(), cx);
+        }
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range_utf16: Option<Range<usize>>,
+        text: &str,
+        selected_range_utf16: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.control.can_write_direct() {
+            self.preedit.set(text, selected_range_utf16);
+        } else {
+            self.preedit.clear();
+        }
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        _element_bounds: Bounds<Pixels>,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let origin = self.cursor_origin()?;
+        let metrics = self.grid_metrics(origin, self.cell);
+        let line_height = metrics.line_height;
+        let line = grid::shape_preedit(self.preedit.text(), &metrics, &self.theme, window);
+        let range = self.preedit.utf8_range(range_utf16);
+        Some(Bounds::from_corners(
+            origin + point(line.x_for_index(range.start), px(0.)),
+            origin + point(line.x_for_index(range.end), line_height),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
     }
 }
 
@@ -628,8 +767,17 @@ impl TerminalWindow {
                         let Some(terminal) = &this.terminal else {
                             return;
                         };
-                        // 命令框编辑时隐藏终端光标，避免同时出现两个活动光标。
-                        let cursor = this.control.can_write_direct().then(|| {
+                        let direct = this.control.can_write_direct();
+                        // 直接交互时终端自己接收输入法：组字显示在光标处，上屏后写入 PTY。
+                        if direct {
+                            window.handle_input(
+                                &this.focus,
+                                ElementInputHandler::new(bounds, cx.entity()),
+                                cx,
+                            );
+                        }
+                        // 命令框编辑或输入法组字时隐藏终端光标，避免同时出现两个插入点。
+                        let cursor = (direct && this.preedit.is_empty()).then(|| {
                             if window.is_window_active() && this.focus.is_focused(window) {
                                 CursorFocus::Focused
                             } else {
@@ -637,13 +785,22 @@ impl TerminalWindow {
                             }
                         });
                         let frame = grid::layout(terminal, &this.theme, cursor);
-                        let metrics = GridMetrics {
-                            origin: bounds.origin,
-                            cell,
-                            line_height: px(this.theme.metrics.line_height),
-                            font_size: px(this.theme.metrics.font_size),
-                        };
+                        let metrics = this.grid_metrics(bounds.origin, cell);
                         grid::paint(&frame, &metrics, bounds, &this.theme, window, cx);
+                        if direct
+                            && !this.preedit.is_empty()
+                            && let Some(origin) = this.cursor_origin()
+                        {
+                            grid::paint_preedit(
+                                this.preedit.text(),
+                                this.preedit.caret(),
+                                origin,
+                                &metrics,
+                                &this.theme,
+                                window,
+                                cx,
+                            );
+                        }
                     });
                 },
             )

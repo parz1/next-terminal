@@ -2,10 +2,10 @@
 use crate::theme::{self, Theme};
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine,
-    SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill,
-    point, prelude::*, px, relative, size,
+    EntityInputHandler, FocusHandle, Focusable, Font, GlobalElementId, KeyBinding, LayoutId,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
+    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
+    fill, point, prelude::*, px, relative, size,
 };
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
@@ -60,6 +60,8 @@ pub struct CommandEditor {
     marked_range: Option<Range<usize>>,
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
+    /// 上一帧使用的字体，用来在重绘前为输入法重新排版当前内容。
+    last_font: Option<(Font, Pixels)>,
     is_selecting: bool,
     scroll_x: Pixels,
     pub error: Option<SharedString>,
@@ -76,6 +78,7 @@ impl CommandEditor {
             marked_range: None,
             last_layout: None,
             last_bounds: None,
+            last_font: None,
             is_selecting: false,
             scroll_x: px(0.),
             error: None,
@@ -301,6 +304,32 @@ impl CommandEditor {
             .unwrap_or(self.content.len())
     }
 
+    /// 当前内容的排版。输入法在设置组字文本后、重绘之前就会查询候选框位置，
+    /// 此时上一帧的排版是旧内容（空内容时甚至是占位提示），不能直接使用。
+    fn current_layout(&self, window: &Window) -> Option<ShapedLine> {
+        if let Some(layout) = self
+            .last_layout
+            .as_ref()
+            .filter(|layout| layout.text == self.content)
+        {
+            return Some(layout.clone());
+        }
+        let (font, font_size) = self.last_font.clone()?;
+        let run = TextRun {
+            len: self.content.len(),
+            font,
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        Some(
+            window
+                .text_system()
+                .shape_line(self.content.clone(), font_size, &[run], None),
+        )
+    }
+
     fn reset(&mut self) {
         self.scroll_x = px(0.);
         self.error = None;
@@ -423,18 +452,18 @@ impl EntityInputHandler for CommandEditor {
         &mut self,
         range_utf16: Range<usize>,
         bounds: Bounds<Pixels>,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let last_layout = self.last_layout.as_ref()?;
+        let layout = self.current_layout(window)?;
         let range = self.range_from_utf16(&range_utf16);
         Some(Bounds::from_corners(
             point(
-                bounds.left() + last_layout.x_for_index(range.start) - self.scroll_x,
+                bounds.left() + layout.x_for_index(range.start) - self.scroll_x,
                 bounds.top(),
             ),
             point(
-                bounds.left() + last_layout.x_for_index(range.end) - self.scroll_x,
+                bounds.left() + layout.x_for_index(range.end) - self.scroll_x,
                 bounds.bottom(),
             ),
         ))
@@ -447,9 +476,11 @@ impl EntityInputHandler for CommandEditor {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         let line_point = self.last_bounds?.localize(&point)?;
-        let last_layout = self.last_layout.as_ref()?;
-
-        assert_eq!(last_layout.text, self.content);
+        // 组字或刚修改后尚未重绘时，上一帧排版与内容不一致；不能据此换算位置。
+        let last_layout = self
+            .last_layout
+            .as_ref()
+            .filter(|layout| layout.text == self.content)?;
         let utf8_index = last_layout.index_for_x(line_point.x + self.scroll_x)?;
         Some(self.offset_to_utf16(utf8_index))
     }
@@ -461,6 +492,7 @@ struct TextElement {
 
 struct PrepaintState {
     line: Option<ShapedLine>,
+    font: (Font, Pixels),
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
     shift: Pixels,
@@ -603,6 +635,7 @@ impl Element for TextElement {
         };
         PrepaintState {
             line: Some(line),
+            font: (style.font(), font_size),
             cursor,
             selection,
             shift,
@@ -644,10 +677,12 @@ impl Element for TextElement {
                 window.paint_quad(cursor);
             }
 
+            let font = prepaint.font.clone();
             self.input.update(cx, |input, _cx| {
                 input.scroll_x = prepaint.shift;
                 input.last_layout = Some(line);
                 input.last_bounds = Some(bounds);
+                input.last_font = Some(font);
             });
         });
     }
