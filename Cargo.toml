@@ -1,0 +1,15 @@
+[package]
+name = "next-terminal"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+alacritty_terminal = "=0.26.0"
+anyhow = "1"
+async-channel = "2"
+gpui = "=0.2.2"
+portable-pty = "=0.9.0"
+tempfile = "=3.27.0"
+
+unicode-segmentation = "=1.13.3"
